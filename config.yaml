@@ -1,0 +1,83 @@
+dataset:
+  root: "./dataset/dataset_box_pose/gt_keypoints"
+
+  image_dir: "images"
+  gt_label_dir: "labels"
+  meta_dir: "meta"            # replaces offset_label_dir
+  models_dir: "models"        # PLY + models_info.json (reserved for later use)
+
+  image_size: 320
+  heatmap_size: 80          # must be image_size / 4
+  roi_padding: 0.5
+  min_roi_size: 32
+
+  train_ratio: 0.8
+  split_seed: 42
+
+# Online rigid-body offset applied to the GT pose at every iteration.
+# Rotation is about the PLY bbox center, translation is along object axes.
+# Set the ranges to cover the error distribution of your upstream estimator.
+offset:
+  enabled: true
+  translation_mm:
+    x: [-30.0, 30.0]
+    y: [-30.0, 30.0]
+    z: [-30.0, 30.0]
+  rotation_deg:
+    x: [-15.0, 15.0]
+    y: [-15.0, 15.0]
+    z: [-15.0, 15.0]
+  random_scale: true          # per-sample magnitude s ~ U(min_scale, 1)
+  min_scale: 0.0
+  val_seed: 12345             # validation offsets are fixed -> reproducible metric
+
+model:
+  arch: "unet_softargmax"
+  pretrained: true
+  num_iters: 2              # cascade stages inside the network
+  use_size_condition: true
+  size_scale_mm: 300.0
+
+training:
+  epochs: 10
+  batch_size: 4
+  num_workers: 4
+
+  learning_rate: 0.0001
+  weight_decay: 0.01
+
+  heatmap_loss_weight: 0.1  # KL term (soft-argmax carries the main loss)
+  coordinate_loss_weight: 1.0
+  coordinate_loss_beta: 0.02  # SmoothL1 beta, small because coords are normalized
+  loss_px_scale: 16.0
+  stage_weights: [0.5, 1.0]
+  no_worse_loss_weight: 1.0
+  no_worse_alpha: 1.0
+
+  use_amp: true
+  grad_clip: 5.0
+
+  save_dir: "./runs/keypoint_refinement"
+
+  seed: 42
+
+curriculum:
+  enabled: true
+  start_scale: 1.0
+  min_scale: 0.15
+  shrink_factor: 0.85
+  trigger_improvement: 0.60
+  patience: 3
+  keep_full_prob: 0.2
+
+augmentation:
+  enabled: true
+  brightness: 0.15
+  contrast: 0.15
+  saturation: 0.10
+  noise_std: 0.01
+  blur_probability: 0.10
+
+eval:
+  small_scale: 0.5            # 第二个验证集的全局偏移系数，约 12px 初始误差
+  rigid: true
