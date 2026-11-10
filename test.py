@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import torch
 
-from models.keypoint_refinement import KeypointRefinementNet
+from models.keypoint_refinement import build_model_from_config
 from train import (
     COND_DIM,
     IMAGENET_MEAN,
@@ -22,6 +22,7 @@ from train import (
     get_roi,
     make_gaussian_heatmaps,
     read_config,
+    rigid_project,
     split_samples,
 )
 
@@ -88,6 +89,13 @@ def prepare_input(image_bgr, offset_px, image_size, roi_padding, min_roi_size):
         y0,
         side,
     )
+
+
+def roi_to_pixels(kp_roi, x0, y0, side):
+    out = np.zeros((4, 2), dtype=np.float64)
+    out[:, 0] = x0 + kp_roi[:, 0] * side
+    out[:, 1] = y0 + kp_roi[:, 1] * side
+    return out
 
 
 def draw_keypoints(image, keypoints, color, name, visibility=None):
@@ -177,10 +185,22 @@ def main():
         help="Disable random_scale (always full-magnitude offset).",
     )
     parser.add_argument(
+        "--offset-scale",
+        type=float,
+        default=1.0,
+        help="Global multiplier on the whole offset range (e.g. 0.5 = small offsets).",
+    )
+    parser.add_argument(
         "--val-seed",
         type=int,
         default=None,
         help="Override offset seed base (default: val_seed from offset config).",
+    )
+    parser.add_argument(
+        "--num-iters",
+        type=int,
+        default=None,
+        help="Override the number of cascade stages (new architecture only).",
     )
     parser.add_argument(
         "--max-debug-images",
@@ -198,14 +218,26 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
     ckpt_cfg = checkpoint.get("config") if isinstance(checkpoint, dict) else None
+    ckpt_cfg = ckpt_cfg or {}
 
-    # ---- effective config: model / offset come from the checkpoint when possible
-    model_cfg = copy.deepcopy(config["model"])
+    # ---- model / preprocessing settings come from the checkpoint when possible
+    # (a legacy checkpoint has no "arch" and must NOT inherit it from config.yaml)
+    if ckpt_cfg.get("model"):
+        model_cfg = copy.deepcopy(ckpt_cfg["model"])
+    else:
+        model_cfg = copy.deepcopy(config["model"])
 
-    if ckpt_cfg and "model" in ckpt_cfg:
-        model_cfg.update(ckpt_cfg["model"])
+    dataset_cfg = copy.deepcopy(config["dataset"])
 
-    if ckpt_cfg and "offset" in ckpt_cfg and not args.use_config_offset:
+    for key in ("image_size", "roi_padding", "min_roi_size"):
+        if key in (ckpt_cfg.get("dataset") or {}):
+            dataset_cfg[key] = ckpt_cfg["dataset"][key]
+
+    image_size = int(dataset_cfg["image_size"])
+    roi_padding = float(dataset_cfg["roi_padding"])
+    min_roi_size = int(dataset_cfg["min_roi_size"])
+
+    if ckpt_cfg.get("offset") and not args.use_config_offset:
         offset_cfg = build_offset_config({"offset": ckpt_cfg["offset"]})
     else:
         offset_cfg = build_offset_config(config)
@@ -228,11 +260,6 @@ def main():
         model_cfg.get("size_scale_mm", config["model"].get("size_scale_mm", 300.0))
     )
 
-    dataset_cfg = config["dataset"]
-    image_size = int(dataset_cfg["image_size"])
-    roi_padding = float(dataset_cfg["roi_padding"])
-    min_roi_size = int(dataset_cfg["min_roi_size"])
-
     output_dir = Path(args.output)
     debug_dir = output_dir / "debug_images"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -244,24 +271,34 @@ def main():
         args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
     )
 
-    model = KeypointRefinementNet(
-        pretrained=False,
-        max_delta=float(model_cfg["max_delta"]),
-        cond_dim=cond_dim,
-    )
+    model = build_model_from_config(model_cfg, cond_dim=cond_dim, pretrained=False)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
+    is_cascade = hasattr(model, "num_iters")
+    arch = model_cfg.get("arch") or "legacy (pooled regression)"
+    num_iters = (
+        int(args.num_iters)
+        if (args.num_iters is not None and is_cascade)
+        else (int(model.num_iters) if is_cascade else 1)
+    )
+
     print(f"[INFO] Device     : {device}")
     print(f"[INFO] Checkpoint : {args.checkpoint}")
     print(f"[INFO] Epoch      : {checkpoint.get('epoch', 'unknown')}")
+    print(f"[INFO] Arch       : {arch}")
     print(f"[INFO] cond_dim   : {cond_dim}")
+    print(f"[INFO] Cascade it.: {num_iters}")
+    print(
+        f"[INFO] ROI        : image_size={image_size} roi_padding={roi_padding} "
+        f"min_roi_size={min_roi_size}"
+    )
     print(
         "[INFO] Offset cfg : "
         f"t={offset_cfg['translation_mm']} r={offset_cfg['rotation_deg']} "
         f"random_scale={offset_cfg['random_scale']} min_scale={offset_cfg['min_scale']} "
-        f"val_seed={offset_cfg['val_seed']}"
+        f"val_seed={offset_cfg['val_seed']} global_scale={args.offset_scale}"
     )
 
     samples = build_samples(config_for_samples)
@@ -299,8 +336,11 @@ def main():
     rows = []
 
     # flat per-keypoint records (valid keypoints only)
-    rec_init, rec_pred, rec_kp = [], [], []
+    rec_init, rec_pred, rec_stage1, rec_kp = [], [], [], []
     rec_gt_delta, rec_pred_delta, rec_scale = [], [], []
+
+    # rigid-body consistency (per instance with 4 valid keypoints)
+    rig_resid, rig_proj_err, rig_raw_err = [], [], []
 
     saved_debug = 0
 
@@ -315,9 +355,23 @@ def main():
             height, width = image.shape[:2]
 
             rng = np.random.default_rng(int(offset_cfg["val_seed"]) + pool_index)
-            offset_pixels, offset_scale = make_offset_pixels(
-                sample, offset_cfg, rng, width, height
-            )
+
+            if args.offset_scale != 1.0:
+                result = generate_offset_keypoints(
+                    sample, offset_cfg, rng, global_scale=args.offset_scale
+                )
+
+                if result is None:
+                    offset_pixels = sample["gt_keypoints"][:, :2].astype(
+                        np.float64
+                    ) * np.array([width, height])
+                    offset_scale = 0.0
+                else:
+                    offset_pixels, offset_scale = result[0], float(result[1])
+            else:
+                offset_pixels, offset_scale = make_offset_pixels(
+                    sample, offset_cfg, rng, width, height
+                )
 
             model_input, initial_coords, x0, y0, side = prepare_input(
                 image, offset_pixels, image_size, roi_padding, min_roi_size
@@ -331,13 +385,22 @@ def main():
             if cond_dim > 0:
                 cond = torch.from_numpy(sample["cond"]).float().unsqueeze(0).to(device)
 
-            output = model(model_input, initial_t, cond)
+            if is_cascade:
+                output = model(model_input, initial_t, cond, num_iters=num_iters)
+            else:
+                output = model(model_input, initial_t, cond)
 
             pred_roi = output["keypoints"][0].float().cpu().numpy()
+            pred_pixels = roi_to_pixels(pred_roi, x0, y0, side)
 
-            pred_pixels = np.zeros((4, 2), dtype=np.float64)
-            pred_pixels[:, 0] = x0 + pred_roi[:, 0] * side
-            pred_pixels[:, 1] = y0 + pred_roi[:, 1] * side
+            stages = output.get("stages")
+
+            if stages:
+                stage1_pixels = roi_to_pixels(
+                    stages[0]["keypoints"][0].float().cpu().numpy(), x0, y0, side
+                )
+            else:
+                stage1_pixels = pred_pixels
 
             gt_kps = sample["gt_keypoints"]
             gt_pixels = gt_kps[:, :2].astype(np.float64).copy()
@@ -351,6 +414,7 @@ def main():
 
             init_err = np.linalg.norm(offset_pixels - gt_pixels, axis=1)
             pred_err = np.linalg.norm(pred_pixels - gt_pixels, axis=1)
+            stage1_err = np.linalg.norm(stage1_pixels - gt_pixels, axis=1)
             improve = init_err - pred_err
 
             if valid.any():
@@ -359,6 +423,24 @@ def main():
                 inst_improve = float(improve[valid].mean())
             else:
                 inst_init = inst_pred = inst_improve = float("nan")
+
+            # ---- rigid-body consistency of the final prediction
+            rigid_resid_px = rigid_proj_px = float("nan")
+
+            if valid.all():
+                proj = rigid_project(pred_pixels, sample["K"], sample["kp3d"])
+
+                if proj is not None:
+                    rigid_resid_px = float(
+                        np.linalg.norm(proj - pred_pixels, axis=1).mean()
+                    )
+                    rigid_proj_px = float(
+                        np.linalg.norm(proj - gt_pixels, axis=1).mean()
+                    )
+
+                    rig_resid.append(rigid_resid_px)
+                    rig_proj_err.append(rigid_proj_px)
+                    rig_raw_err.append(inst_pred)
 
             row = {
                 "image": str(sample["relative_path"]),
@@ -369,7 +451,12 @@ def main():
                 "valid_keypoints": int(valid.sum()),
                 "init_error_px": inst_init,
                 "pred_error_px": inst_pred,
+                "stage1_error_px": (
+                    float(stage1_err[valid].mean()) if valid.any() else float("nan")
+                ),
                 "improvement_px": inst_improve,
+                "rigid_residual_px": rigid_resid_px,
+                "rigid_projected_error_px": rigid_proj_px,
             }
 
             for kp in range(4):
@@ -377,6 +464,7 @@ def main():
 
                 row[f"kp{kp}_valid"] = int(ok)
                 row[f"kp{kp}_init_error_px"] = float(init_err[kp]) if ok else ""
+                row[f"kp{kp}_stage1_error_px"] = float(stage1_err[kp]) if ok else ""
                 row[f"kp{kp}_pred_error_px"] = float(pred_err[kp]) if ok else ""
                 row[f"kp{kp}_improvement_px"] = float(improve[kp]) if ok else ""
                 row[f"kp{kp}_gt_dx"] = float(gt_delta[kp, 0]) if ok else ""
@@ -387,6 +475,7 @@ def main():
                 if ok:
                     rec_init.append(init_err[kp])
                     rec_pred.append(pred_err[kp])
+                    rec_stage1.append(stage1_err[kp])
                     rec_kp.append(kp)
                     rec_gt_delta.append(gt_delta[kp])
                     rec_pred_delta.append(pred_delta[kp])
@@ -458,6 +547,7 @@ def main():
 
     init_arr = np.asarray(rec_init, dtype=np.float64)
     pred_arr = np.asarray(rec_pred, dtype=np.float64)
+    stage1_arr = np.asarray(rec_stage1, dtype=np.float64)
     kp_arr = np.asarray(rec_kp, dtype=np.int64)
     gt_d = np.asarray(rec_gt_delta, dtype=np.float64)
     pr_d = np.asarray(rec_pred_delta, dtype=np.float64)
@@ -467,10 +557,23 @@ def main():
     print("TEST SUMMARY")
     print("=" * 78)
     print(f"Split           : {args.split}")
+    print(f"Arch            : {arch}   cascade iterations: {num_iters}")
     print(f"Valid keypoints : {len(init_arr)}")
     print(f"Overall         : {fmt_summary(summarize(init_arr, pred_arr))}")
 
-    # per-instance (each instance equally weighted)
+    if is_cascade and num_iters > 1:
+        print(
+            f"Per stage       : init {init_arr.mean():.3f} -> "
+            f"stage1 {stage1_arr.mean():.3f} -> final {pred_arr.mean():.3f}px"
+        )
+
+    print(
+        f"PCK             : <3px {np.mean(pred_arr < 3) * 100:.1f}%   "
+        f"<5px {np.mean(pred_arr < 5) * 100:.1f}%   "
+        f"<10px {np.mean(pred_arr < 10) * 100:.1f}%   "
+        f"(median error {np.median(pred_arr):.3f}px, p90 {np.percentile(pred_arr, 90):.3f}px)"
+    )
+
     inst_improve_vals = np.asarray(
         [r["improvement_px"] for r in rows if np.isfinite(r["improvement_px"])]
     )
@@ -479,6 +582,13 @@ def main():
             f"Per-instance    : mean improvement {inst_improve_vals.mean():+.3f}px, "
             f"median {np.median(inst_improve_vals):+.3f}px, "
             f"worse instances {np.mean(inst_improve_vals < 0) * 100:.1f}%"
+        )
+
+    if rig_resid:
+        print(
+            f"Rigid (IPPE)    : residual {np.mean(rig_resid):.3f}px | "
+            f"error raw {np.mean(rig_raw_err):.3f} -> projected "
+            f"{np.mean(rig_proj_err):.3f}px (n={len(rig_resid)})"
         )
 
     print("\n" + "-" * 78)
@@ -493,6 +603,12 @@ def main():
 
         label = f"[{lo:g}, {hi:g})" if np.isfinite(hi) else f"[{lo:g}, inf)"
         print(f"{label:<12} {fmt_summary(summarize(init_arr[m], pred_arr[m]))}")
+
+        if is_cascade and num_iters > 1:
+            print(
+                f"{'':<12} stage1 {stage1_arr[m].mean():.3f}px -> "
+                f"final {pred_arr[m].mean():.3f}px"
+            )
 
     print("\n" + "-" * 78)
     print("PER-KEYPOINT")
@@ -559,12 +675,15 @@ def main():
         print("BY OFFSET SCALE (random_scale factor)")
         print("-" * 78)
 
-        for lo, hi in ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)):
-            m = (scale_arr >= lo) & (scale_arr < hi)
+        top = float(scale_arr.max()) + 1e-6
+        edges = np.linspace(0.0, top, 5)
+
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (scale_arr >= lo) & (scale_arr < hi + 1e-9)
 
             if m.any():
                 print(
-                    f"[{lo:.2f}, {min(hi, 1.0):.2f}) "
+                    f"[{lo:.2f}, {hi:.2f}) "
                     f"{fmt_summary(summarize(init_arr[m], pred_arr[m]))}"
                 )
 

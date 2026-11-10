@@ -17,11 +17,17 @@ python visualize.py \
     --dataset /home/yeo/Downloads/pose_refine/dataset/dataset_box_pose/gt_keypoints \
     --label-type gt \
     --num-samples 30
+```
 
-python visualize.py \
-    --dataset /home/yeo/Downloads/pose_refine/dataset/dataset_box_pose/gt_keypoints \
-    --label-type offset \
-    --num-samples 30
+## merge
+
+```bash
+python merge_keypoint_dataset.py \
+    --inputs \
+        /home/yeo/Downloads/pose_refine/dataset/dataset_box_pose/gt_keypoints \
+        /home/yeo/Downloads/pose_refine/dataset/dataset_random/gt_keypoints \
+    --output \
+        /home/yeo/Downloads/pose_refine/dataset/dataset_merged/gt_keypoints
 ```
 
 ## train
