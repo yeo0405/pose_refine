@@ -1,5 +1,5 @@
 dataset:
-  root: "./dataset/dataset_box_pose/gt_keypoints"
+  root: "./dataset/dataset_merged/gt_keypoints"
 
   image_dir: "images"
   gt_label_dir: "labels"
